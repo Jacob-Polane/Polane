@@ -1,0 +1,16 @@
+/.vs/*
+**/*.suo
+**/*.user
+**/*.bak
+**/*.orig
+**/UpgradeLog.htm
+**/bin/*
+**/obj/*
+**/App_Data/Logs/*
+**/ElmahLogs/*
+Logs
+/src/polane.Polane.Web.Host/web.config
+/src/polane.Polane.Web.Host/polane.Polane.Web.Core.xml
+/sh.exe.stackdump
+
+
