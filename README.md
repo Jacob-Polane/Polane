@@ -1,2 +1,2 @@
 # Polane
-Github testing
+Testing build changed variable
