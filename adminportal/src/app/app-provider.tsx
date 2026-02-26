@@ -9,6 +9,7 @@ import {
 } from "@shesha-io/reactjs";
 import { AppProgressBar } from "next-nprogress-bar";
 import { useTheme } from "antd-style";
+import { PolanePlugin } from "@shesha-io/polane";
 
 export interface IAppProviderProps {
   backendUrl: string;
@@ -30,7 +31,9 @@ export const AppProvider: FC<PropsWithChildren<IAppProviderProps>> = ({
         noAuth={nextRouter.path?.includes('/no-auth')}
       >
         <StoredFilesProvider baseUrl={backendUrl} ownerId={""} ownerType={""}>
+          <PolanePlugin >
           {children}
+          </PolanePlugin>
         </StoredFilesProvider>
       </ShaApplicationProvider>
     </GlobalStateProvider>

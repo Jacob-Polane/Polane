@@ -1,0 +1,67 @@
+{
+  "name": "@shesha-io/polane",
+  "version": "0.0.1",
+  "description": "Polane custom Shesha components library",
+  "author": "Polane",
+  "license": "MIT",
+  "main": "dist/index.js",
+  "module": "dist/index.es.js",
+  "jsnext:main": "dist/index.es.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20",
+    "npm": ">=10"
+  },
+  "publishConfig": {
+    "registry": "https://pkgs.dev.azure.com/boxfusion/_packaging/npm.shesha.dev/npm/registry/"
+  },
+  "scripts": {
+    "build": "rimraf dist && cross-env NODE_ENV=production BABEL_ENV=production && rollup -c",
+    "build:watch": "rollup -c -w",
+    "lint": "eslint src/**/*.ts{,x}",
+    "lint:fix": "eslint src/**/*.ts{,x} --fix",
+    "check-types": "tsc",
+    "release": "npm publish",
+    "prepare": "npm run build"
+  },
+  "peerDependencies": {
+    "@ant-design/icons": "^5.2.6",
+    "react": "^18.x",
+    "react-dom": "^18.x"
+  },
+  "devDependencies": {
+    "@ant-design/icons": "^5.2.6",
+    "@eslint/js": "^9.14.0",
+    "@rollup/plugin-commonjs": "^25.0.2",
+    "@rollup/plugin-eslint": "^9.0.5",
+    "@rollup/plugin-json": "^6.0.0",
+    "@rollup/plugin-node-resolve": "^15.1.0",
+    "@rollup/plugin-terser": "^0.4.3",
+    "@rollup/plugin-typescript": "^10.0.1",
+    "@rollup/plugin-url": "^8.0.1",
+    "@shesha-io/reactjs": "0.41.6",
+    "@types/react": "^18.2.21",
+    "@types/react-dom": "^18.2.7",
+    "@typescript-eslint/eslint-plugin": "^8.13.0",
+    "@typescript-eslint/parser": "^8.13.0",
+    "cross-env": "^7.0.3",
+    "eslint": "^9.14.0",
+    "eslint-plugin-react-hooks": "^5.0.0",
+    "postcss": "^8.3.6",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "rimraf": "^5.0.7",
+    "rollup": "^3.26.0",
+    "rollup-plugin-local-resolve": "^1.0.7",
+    "rollup-plugin-peer-deps-external": "^2.2.4",
+    "rollup-plugin-postcss": "^4.0.2",
+    "tslib": "^2.5.2",
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "antd": "5.17.4"
+  }
+}
