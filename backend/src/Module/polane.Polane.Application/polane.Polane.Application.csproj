@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
@@ -13,6 +13,7 @@
 
     <!-- Include DLLs and XML documentation files in the NuGet package output -->
     <AllowedOutputExtensionsInPackageBuildOutput>.dll;.xml;.pdb</AllowedOutputExtensionsInPackageBuildOutput>
+    <GeneratePackageOnBuild>True</GeneratePackageOnBuild>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
