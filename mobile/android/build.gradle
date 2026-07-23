@@ -19,10 +19,12 @@ buildscript {
                     // This should always be `mapbox` (not your username).
                     username = 'mapbox'
                     // Secret sk.… token used to DOWNLOAD the Mapbox native SDK at
-                    // build time. Read from the MAPBOX_ACCESS_KEY env var (CI)
-                    // or a gradle property (local ~/.gradle/gradle.properties).
-                    // Building with no token 401s when resolving com.mapbox.* artifacts.
-                    password = System.getenv('MAPBOX_ACCESS_KEY') ?: (project.findProperty('MAPBOX_ACCESS_KEY') ?: '')
+                    // build time. Read from the MAPBOX_DOWNLOADS_TOKEN env var (CI)
+                    // or a gradle property (local ~/.gradle/gradle.properties). This
+                    // must be a secret downloads token (DOWNLOADS:READ scope) —
+                    // the public MAPBOX_ACCESS_KEY runtime key will not authenticate
+                    // here. Building with no token 401s when resolving com.mapbox.* artifacts.
+                    password = System.getenv('MAPBOX_DOWNLOADS_TOKEN') ?: (project.findProperty('MAPBOX_DOWNLOADS_TOKEN') ?: '')
                 }
             }
         }
