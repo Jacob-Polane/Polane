@@ -1,0 +1,425 @@
+# Mobile (Android) build + distribution pipeline.
+#
+# 1. Builds a release APK and publishes it as a build artifact.
+# 2. Uploads the APK to LambdaTest (real-device cloud).
+# 3. Emails the mobile testers a link to the new build.
+#
+# REUSABLE ACROSS PROJECTS — nothing is hard-coded to one app:
+#   * App / artifact / LambdaTest names derive from the repo name
+#     ($(Build.Repository.Name), exposed as the 'appName' variable).
+#   * The variable group name is the 'variableGroup' parameter below.
+# Drop this file into any repo with the same `mobile/` structure and it works.
+#
+# App code lives in the `mobile/` subfolder, hence the `mobile/` path prefixes.
+#
+# REQUIRED — create an Azure DevOps variable group (Pipelines -> Library) whose
+# name matches the 'variableGroup' parameter (default 'Mobile Build Group'),
+# authorize it for this pipeline, and add:
+#
+#   # App .env (baked into the build by react-native-config — see notes below)
+#   BASE_URL            e.g. https://your-api.azurewebsites.net
+#   APP_KEY
+#   GOOGLE_MAPS_KEY
+#   GOOGLE_PLACES_KEY
+#   MAPBOX_ACCESS_KEY          (runtime pk.… token used by the app)
+#   ONE_SIGNAL_APP_ID
+#   HOME_URL            (required) home module path
+#   ONBOARD_URL         (required) onboarding module path
+#   MAPBOX_DOWNLOADS_TOKEN     (secret) sk.… token used by gradle to DOWNLOAD the
+#                              Mapbox native SDK at build time. WITHOUT it the build
+#                              401s resolving com.mapbox.* — see android/build.gradle.
+#
+#   # Distribution
+#   LT_USERNAME
+#   LT_ACCESS_KEY       (secret)
+#   SMTP_HOST
+#   SMTP_PORT
+#   SMTP_USERNAME
+#   SMTP_PASSWORD       (secret)
+#   SMTP_FROM
+#
+# Tester recipients + email templates live in mobile/ci/notifications.json.
+#
+# BASE_URL / .env NOTE: this app reads its backend URL from Config.BASE_URL via
+# react-native-config (mobile/.env). There is NO in-code fallback — a missing
+# BASE_URL breaks every API call. The 'Generate mobile/.env' step below writes
+# .env from the variable group and FAILS the build if BASE_URL is empty. To
+# target a different backend for one run, override BASE_URL via "Run pipeline ->
+# Variables" (queue-time vars win over the group value).
+
+parameters:
+- name: variableGroup
+  type: string
+  default: 'Mobile Build Group'
+
+trigger:
+  branches:
+    include:
+    - mobile-solution-dev
+  paths:
+    include:
+    - mobile/*
+    - Mobile-Continues-Build-BP.yaml
+
+pr:
+  branches:
+    include:
+    - main
+  paths:
+    include:
+    - mobile/*
+    - Mobile-Continues-Build-BP.yaml
+
+variables:
+- group: ${{ parameters.variableGroup }}   # holds .env values + LT_/SMTP_ secrets
+- name: appName                            # drives app / artifact / LambdaTest names
+  value: $(Build.Repository.Name)
+- name: GRADLE_USER_HOME
+  value: $(Pipeline.Workspace)/.gradle
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+- stage: build_android
+  displayName: Build Android
+  jobs:
+  - job: build_apk
+    displayName: Build Release APK
+    timeoutInMinutes: 60
+    steps:
+    # Microsoft-hosted agents preinstall many large toolchains a React Native
+    # Android build never touches (dotnet, Haskell/GHC, CodeQL, Swift, PowerShell,
+    # spare Android NDKs, cached docker images). Android + node_modules + our
+    # restored caches can otherwise exhaust the root disk ("No space left on
+    # device"), so reclaim ~20-30 GB up front. Nothing removed here is used by the
+    # build: Java comes from the preinstalled JDK in /usr/lib/jvm (left intact),
+    # and the SDK step below reinstalls the single NDK we need.
+    - bash: |
+        echo "Disk before cleanup:"; df -h /
+        sudo rm -rf \
+          /usr/share/dotnet \
+          /opt/ghc /usr/local/.ghcup \
+          /opt/hostedtoolcache/CodeQL \
+          /usr/share/swift \
+          /usr/local/share/powershell \
+          /usr/local/lib/android/sdk/ndk 2>/dev/null || true
+        docker image prune -af 2>/dev/null || true
+        sudo apt-get clean 2>/dev/null || true
+        echo "Disk after cleanup:"; df -h /
+      displayName: Free up disk space
+
+    # Repo is checked out automatically (self) since this pipeline lives in the
+    # same repo as the app.
+    - task: JavaToolInstaller@0
+      displayName: Use Java 17
+      inputs:
+        versionSpec: "17"
+        jdkArchitectureOption: x64
+        jdkSourceOption: PreInstalled
+
+    - task: NodeTool@0
+      displayName: Use Node 18
+      inputs:
+        versionSpec: "18.x"
+
+    # Restore the Yarn Berry package cache (project-local .yarn/cache — Berry's
+    # default when enableGlobalCache is unset). Keyed on the lockfile so it only
+    # invalidates when dependencies change; saved automatically at job end.
+    - task: Cache@2
+      displayName: Cache Yarn Berry packages
+      inputs:
+        key: 'yarn | "$(Agent.OS)" | mobile/yarn.lock'
+        restoreKeys: |
+          yarn | "$(Agent.OS)"
+        path: mobile/.yarn/cache
+
+    # This project uses Yarn Berry (Yarn 3.6.4) — config in mobile/.yarnrc.yml,
+    # nodeLinker: node-modules. There is no "packageManager" field, so Corepack
+    # (bundled with Node 18) is told the exact version explicitly. Auth to the
+    # private @shesha feed comes from mobile/.yarnrc.yml (npmScopes ->
+    # npmAuthIdent); Berry does NOT read .npmrc, so no NpmAuthenticate step needed.
+    #
+    # LOCKFILE: if a Berry-format yarn.lock is committed we install with
+    # --immutable (reproducible, fails if the lockfile is stale). Otherwise — a
+    # fresh scaffold ships a Yarn v1 lockfile, or none at all — we let Berry
+    # generate/migrate it in place, so no manual "commit a Berry lockfile" step is
+    # required before the first run. Commit the resulting Berry yarn.lock when you
+    # want reproducible, --immutable builds.
+    - task: CmdLine@2
+      displayName: Install node dependencies (Yarn Berry)
+      inputs:
+        script: |
+          set -e
+          corepack enable
+          cd mobile
+          corepack prepare yarn@3.6.4 --activate
+          yarn --version
+          if [ -f yarn.lock ] && grep -q "__metadata:" yarn.lock; then
+            echo "Berry-format yarn.lock found — installing with --immutable."
+            yarn install --immutable
+          else
+            echo "No Berry lockfile (v1 or missing) — generating/migrating it now."
+            yarn install
+          fi
+
+    # Restore the ~1 GB NDK so sdkmanager finds it already installed (its
+    # package.xml is cached too) and skips the download. Constant key — the NDK
+    # version is pinned.
+    - task: Cache@2
+      displayName: Cache Android NDK 26.1.10909125
+      inputs:
+        # Version is quoted so the Cache task treats it as a literal string, not a
+        # file path to hash (an unquoted "26.1.10909125" is misread as a filename).
+        key: 'ndk | "$(Agent.OS)" | "26.1.10909125"'
+        path: $(ANDROID_SDK_ROOT)/ndk/26.1.10909125
+
+    # Restore the Gradle DEPENDENCY cache (modules-2 = downloaded Mapbox/RN/AndroidX
+    # artifacts) and the wrapper distribution. We deliberately cache ONLY these two
+    # sub-dirs, NOT the whole $(GRADLE_USER_HOME): the full home also holds
+    # build-cache-1 / transforms / daemon dirs — multi-GB and tens of thousands of
+    # churny files — whose post-job save is slow enough to time out. modules-2 is
+    # the biggest, most stable win (and means a Mapbox token blip won't fail the
+    # build once artifacts are cached). Keyed on the gradle build scripts + wrapper.
+    - task: Cache@2
+      displayName: Cache Gradle dependencies
+      inputs:
+        key: 'gradle | "$(Agent.OS)" | mobile/android/**/gradle-wrapper.properties, mobile/android/**/*.gradle*'
+        restoreKeys: |
+          gradle | "$(Agent.OS)"
+        path: $(GRADLE_USER_HOME)/caches/modules-2
+
+    - task: Cache@2
+      displayName: Cache Gradle wrapper dist
+      inputs:
+        key: 'gradle-wrapper | "$(Agent.OS)" | mobile/android/**/gradle-wrapper.properties'
+        restoreKeys: |
+          gradle-wrapper | "$(Agent.OS)"
+        path: $(GRADLE_USER_HOME)/wrapper/dists
+
+    # RN 0.74 targets a MODERN SDK (compileSdk/buildTools 34, NDK 26.1.10909125,
+    # via AGP from the RN gradle plugin) — no v2-schema / clean-SDK workaround is
+    # needed. Just make sure the required packages exist on the hosted image and
+    # licenses are accepted.
+    - task: CmdLine@2
+      displayName: Install Android SDK packages (34 / build-tools 34 / ndk 26.1)
+      inputs:
+        script: |
+          set -e
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" \
+            "platform-tools" \
+            "build-tools;34.0.0" \
+            "platforms;android-34" \
+            "ndk;26.1.10909125" 2>&1 | tail -8
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          echo "sdk.dir=$ANDROID_HOME" > mobile/android/local.properties
+          echo "Android SDK ready at $ANDROID_HOME"
+
+    # Write mobile/.env from the variable group. react-native-config bakes these
+    # into the native build (BuildConfig) at gradle time, so .env MUST exist before
+    # the build. Values are mapped via env: so this works whether or not a given
+    # variable is marked secret. BASE_URL is required (no in-code fallback).
+    - task: CmdLine@2
+      displayName: Generate mobile/.env
+      env:
+        BASE_URL:          $(BASE_URL)
+        APP_KEY:           $(APP_KEY)
+        GOOGLE_MAPS_KEY:   $(GOOGLE_MAPS_KEY)
+        GOOGLE_PLACES_KEY: $(GOOGLE_PLACES_KEY)
+        MAPBOX_ACCESS_KEY: $(MAPBOX_ACCESS_KEY)
+        ONE_SIGNAL_APP_ID: $(ONE_SIGNAL_APP_ID)
+        HOME_URL:          $(HOME_URL)
+        ONBOARD_URL:       $(ONBOARD_URL)
+      inputs:
+        script: |
+          set -e
+          # REQUIRED — the build fails if any of these is missing from the variable
+          # group (empty) or the group isn't authorized (un-substituted "$(VAR)"
+          # literal). There is no in-app fallback in CI: these must be set.
+          for var in BASE_URL HOME_URL ONBOARD_URL; do
+            val="${!var}"
+            if [ -z "$val" ] || [ "${val#\$(}" != "$val" ]; then
+              echo "ERROR: $var not set — add it to the '${{ parameters.variableGroup }}' variable group (or set it at queue time)." >&2
+              exit 1
+            fi
+          done
+          cd mobile
+          {
+            echo "BASE_URL=${BASE_URL}"
+            echo "APP_KEY=${APP_KEY}"
+            echo "GOOGLE_MAPS_KEY=${GOOGLE_MAPS_KEY}"
+            echo "GOOGLE_PLACES_KEY=${GOOGLE_PLACES_KEY}"
+            echo "MAPBOX_ACCESS_KEY=${MAPBOX_ACCESS_KEY}"
+            echo "ONE_SIGNAL_APP_ID=${ONE_SIGNAL_APP_ID}"
+            echo "HOME_URL=${HOME_URL}"
+            echo "ONBOARD_URL=${ONBOARD_URL}"
+          } > .env
+          echo "mobile/.env written (BASE_URL=${BASE_URL}; API keys hidden)."
+
+    # Generate the release keystore the build expects (android/app/release.keystore).
+    # It is not committed (*.keystore is gitignored), so create it with the
+    # alias/passwords that android/app/build.gradle already references. A
+    # self-generated key is fine for LambdaTest device testing (only Play Store
+    # updates need a stable key). keytool ships with the JDK installed above.
+    - task: CmdLine@2
+      displayName: Generate release keystore
+      inputs:
+        script: |
+          set -e
+          KEYSTORE="mobile/android/app/release.keystore"
+          if [ ! -f "$KEYSTORE" ]; then
+            keytool -genkeypair -v \
+              -keystore "$KEYSTORE" \
+              -alias release \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass 'P@ssw0rd' -keypass 'P@ssw0rd' \
+              -dname "CN=$(appName), OU=Mobile, O=Boxfusion, L=Centurion, ST=Gauteng, C=ZA"
+          fi
+          echo "Keystore ready at $KEYSTORE"
+
+    - task: CmdLine@2
+      displayName: Build release APK
+      env:
+        GRADLE_USER_HOME: $(GRADLE_USER_HOME)
+        # Secret sk.… token so gradle can download the Mapbox native SDK
+        # (android/build.gradle reads MAPBOX_DOWNLOADS_TOKEN). Passed via env so it
+        # never appears on the gradle command line / in logs.
+        MAPBOX_DOWNLOADS_TOKEN: $(MAPBOX_DOWNLOADS_TOKEN)
+      inputs:
+        script: |
+          set -e
+          if [ -z "${MAPBOX_DOWNLOADS_TOKEN}" ] || [ "${MAPBOX_DOWNLOADS_TOKEN#\$(}" != "${MAPBOX_DOWNLOADS_TOKEN}" ]; then
+            echo "WARNING: MAPBOX_DOWNLOADS_TOKEN not set — the build will 401 downloading the Mapbox SDK unless it is already cached." >&2
+          fi
+          chmod +x mobile/android/gradlew
+          cd mobile/android
+
+          # Capture full output, but on failure print just the "What went wrong"
+          # block at the very end so the cause is readable without scrolling.
+          LOG=/tmp/gradle-build.log
+          set +e
+          # --build-cache: reuse cached task outputs (Gradle home is cached above).
+          # -x lintVitalRelease: skip release lint (not needed for test distribution).
+          # -PreactNativeArchitectures=arm64-v8a: build a single ABI — all modern
+          #   real devices incl. LambdaTest. NOTE: this APK will NOT install on
+          #   x86/x86_64 emulators; drop this flag (or add x86_64) if you need that.
+          ./gradlew assembleRelease \
+            --no-daemon --build-cache \
+            -x lintVitalRelease \
+            -PreactNativeArchitectures=arm64-v8a \
+            2>&1 | tee "$LOG"
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo ""
+            echo "==================== BUILD FAILURE (what went wrong) ===================="
+            awk '/(\* What went wrong:|FAILURE: Build failed)/{f=1} f{print} /BUILD FAILED/{f=0}' "$LOG" | head -80
+            echo "========================================================================"
+            exit "$rc"
+          fi
+
+    - task: CopyFiles@2
+      displayName: Stage APK
+      inputs:
+        SourceFolder: mobile/android/app/build/outputs/apk/release
+        Contents: "*.apk"
+        TargetFolder: $(Build.ArtifactStagingDirectory)
+
+    - task: PublishBuildArtifacts@1
+      displayName: Publish APK artifact
+      inputs:
+        PathtoPublish: $(Build.ArtifactStagingDirectory)
+        ArtifactName: $(appName)-release-apk
+        publishLocation: Container
+
+    # ─────────────────────────────────────────────────────────────────────
+    # DISTRIBUTION — uploads the APK to LambdaTest and emails the testers.
+    # Requires the '${{ parameters.variableGroup }}' variable group (see header).
+    # ─────────────────────────────────────────────────────────────────────
+
+    # ── Upload to LambdaTest ─────────────────────────────────────────
+    # Requires LT_USERNAME and LT_ACCESS_KEY in the variable group
+    # (LT_ACCESS_KEY must be marked secret). Secrets must be passed via
+    # env: rather than inline $(...) substitution.
+    - script: |
+        set -e
+        if [ -z "${LT_USERNAME}" ] || [ -z "${LT_ACCESS_KEY}" ] || [ "${LT_USERNAME#\$(}" != "${LT_USERNAME}" ]; then
+          echo "ERROR: LT_USERNAME / LT_ACCESS_KEY not set — check the '${{ parameters.variableGroup }}' variable group is authorized for this pipeline." >&2
+          exit 1
+        fi
+        APP_PATH=$(find $(Build.ArtifactStagingDirectory) -name "*.apk" -type f | head -1)
+        echo "Uploading: $APP_PATH"
+
+        RESPONSE=$(curl -sS -u "${LT_USERNAME}:${LT_ACCESS_KEY}" \
+                -X POST "https://manual-api.lambdatest.com/app/upload/realDevice" \
+                -F "appFile=@${APP_PATH}" \
+                -F "name=$(appName)-android-$(Build.BuildNumber)")
+
+        echo "LambdaTest response: $RESPONSE"
+        APP_URL=$(echo "$RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin)['app_url'])")
+        echo "##vso[task.setvariable variable=LT_APP_URL;isOutput=true]$APP_URL"
+        echo "##vso[task.setvariable variable=LT_APP_URL]$APP_URL"
+        echo "Uploaded as: $APP_URL"
+      displayName: Upload to LambdaTest
+      name: ltUpload
+      env:
+        LT_USERNAME: $(LT_USERNAME)
+        LT_ACCESS_KEY: $(LT_ACCESS_KEY)
+
+    # ── Notify Mobile Testers ────────────────────────────────────────
+    # Reads recipients + subject/title/body templates from
+    # mobile/ci/notifications.json. SMTP creds come from the variable group.
+    - script: |
+        python3 <<'EOF'
+        import os, json, smtplib, sys
+        from email.mime.text import MIMEText
+
+        # Sanity-check SMTP env vars — if any look like literal "$(...)" they
+        # weren't substituted (variable missing from the group or not authorized).
+        for key in ('SMTP_HOST','SMTP_PORT','SMTP_USERNAME','SMTP_PASSWORD','SMTP_FROM'):
+            val = os.environ.get(key, '')
+            if not val or val.startswith('$('):
+                sys.exit(f"ERROR: {key} is not set — check the '${{ parameters.variableGroup }}' variable group is authorized and contains {key}.")
+
+        with open("mobile/ci/notifications.json") as f:
+            cfg = json.load(f)
+
+        build    = os.environ['BUILD_NUMBER']
+        app_url  = os.environ['LT_APP_URL']
+        platform = "Android"
+        app_name = f"{os.environ['APP_NAME']}-android-{build}"
+
+        ctx = {"platform": platform, "appName": app_name, "appUrl": app_url, "buildNumber": build}
+
+        subject = cfg["subject"].format(**ctx)
+        title   = cfg["title"].format(**ctx)
+        body    = cfg["body"].format(**ctx)
+        full_body = f"{title}\n\n{body}"
+
+        recipients = [r.strip() for r in cfg["recipients"] if r.strip()]
+        if not recipients:
+            print("No recipients configured — skipping email."); raise SystemExit(0)
+
+        msg = MIMEText(full_body)
+        msg['Subject'] = subject
+        msg['From']    = os.environ['SMTP_FROM']
+        msg['To']      = ', '.join(recipients)
+
+        with smtplib.SMTP(os.environ['SMTP_HOST'], int(os.environ['SMTP_PORT'])) as s:
+            s.starttls()
+            s.login(os.environ['SMTP_USERNAME'], os.environ['SMTP_PASSWORD'])
+            s.send_message(msg)
+
+        print(f"Notified {len(recipients)} tester(s): {recipients}")
+        EOF
+      displayName: Notify Mobile Testers
+      env:
+        LT_APP_URL:    $(LT_APP_URL)
+        BUILD_NUMBER:  $(Build.BuildNumber)
+        APP_NAME:      $(appName)
+        SMTP_HOST:     $(SMTP_HOST)
+        SMTP_PORT:     $(SMTP_PORT)
+        SMTP_USERNAME: $(SMTP_USERNAME)
+        SMTP_PASSWORD: $(SMTP_PASSWORD)
+        SMTP_FROM:     $(SMTP_FROM)

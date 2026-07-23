@@ -1,0 +1,9 @@
+{
+  "_comment": "Recipients + email templates for the 'Notify Mobile Testers' pipeline step. Placeholders available in subject/title/body: {platform} {appName} {appUrl} {buildNumber}. Add tester emails to 'recipients' before running the distribution pipeline.",
+  "recipients": [
+    "you@example.com"
+  ],
+  "subject": "New {platform} build ({buildNumber}) ready for testing",
+  "title": "Mobile app — {platform} build {buildNumber}",
+  "body": "A new {platform} build of the app is available for testing on LambdaTest.\n\nApp: {appName}\nLambdaTest install link: {appUrl}\n\nOpen the link on a LambdaTest real device (or in App Automation) to install and test this build. Reply to this email with any issues found."
+}
